@@ -1,0 +1,17 @@
+{
+  "name": "tualo/ds-sftp-import",
+  "description": "SFTP import package for Tualo Office package",
+  "type": "library",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "Tualo\\Office\\DSSFTPImport\\": "src/"
+    },
+    "files": [
+      "src/functions.php"
+    ]
+  },
+  "minimum-stability": "dev",
+  "require": {},
+  "version": "1.0.1"
+}

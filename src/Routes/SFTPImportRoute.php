@@ -2,6 +2,7 @@
 
 namespace Tualo\Office\DSSFTPImport\Routes;
 
+use phpseclib4\Net\SFTP;
 use Tualo\Office\Basic\Route as BasicRoute;
 use Tualo\Office\Basic\TualoApplication as App;
 use Tualo\Office\DS\DSExporterHelper;
@@ -45,15 +46,7 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
                     $serverPort = (int) $serverPort;
                 }
 
-                if (class_exists(\phpseclib3\Net\SFTP::class)) {
-                    $sftpClass = \phpseclib3\Net\SFTP::class;
-                } elseif (class_exists(\phpseclib\Net\SFTP::class)) {
-                    $sftpClass = \phpseclib\Net\SFTP::class;
-                } else {
-                    throw new \Exception('phpseclib not installed');
-                }
-
-                $sftp = new $sftpClass($serverName, $serverPort);
+                $sftp = new SFTP($serverName, $serverPort);
                 if (!$sftp->login($server['username'], $server['password'])) {
                     throw new \Exception('Login Failed');
                 }
@@ -73,7 +66,7 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
 
                 $fileMatch = (string) ($server['filematch'] ?? '*');
                 $fileMatchParts = array_map(
-                    static fn ($part) => preg_quote($part, '/'),
+                    static fn($part) => preg_quote($part, '/'),
                     explode('*', $fileMatch)
                 );
                 $filePattern = '/^' . implode('.*', $fileMatchParts) . '$/i';
@@ -81,9 +74,6 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
                 $sftp->enableDatePreservation();
                 $sftp->setListOrder('mtime', SORT_ASC);
                 $files = $sftp->nlist($server['path']);
-                if ($files === false) {
-                    throw new \Exception('Unable to list files on SFTP server');
-                }
 
                 foreach ($files as $filename) {
                     if (in_array($filename, ['.', '..'], true)) {
@@ -103,9 +93,7 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
                     $localPath = $temporaryFolder . $localFilename;
                     $currentFilename = $filename;
                     try {
-                        if ($sftp->get(rtrim($server['path'], '/') . '/' . $filename, $localPath) === false) {
-                            throw new \Exception('Unable to download file');
-                        }
+                        $sftp->get(rtrim($server['path'], '/') . '/' . $filename, $localPath);
 
                         if (in_array($extension, ['csv', 'txt'], true) && (int) ($server['encode_utf8'] ?? 0) === 1) {
                             $contents = file_get_contents($localPath);
@@ -135,8 +123,8 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
 
                         $db->direct(
                             'insert into `' . $tablename . '_imported` (md5id,filename,importdatetime) '
-                            . 'values ({md5id},{filename},now()) '
-                            . 'on duplicate key update importdatetime=values(importdatetime)',
+                                . 'values ({md5id},{filename},now()) '
+                                . 'on duplicate key update importdatetime=values(importdatetime)',
                             ['filename' => $currentFilename, 'md5id' => $currentMd5]
                         );
 
@@ -151,9 +139,8 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
                             ['md5id' => $currentMd5]
                         );
 
-                        if ((int) ($server['deleteafterimport'] ?? 0) === 1
-                            && !$sftp->delete(rtrim($server['path'], '/') . '/' . $filename)) {
-                            throw new \Exception('Import succeeded but the remote file could not be deleted');
+                        if ((int) ($server['deleteafterimport'] ?? 0) === 1) {
+                            $sftp->delete(rtrim($server['path'], '/') . '/' . $filename);
                         }
                         $debugFiles[$filename] = true;
                     } finally {
@@ -194,18 +181,27 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
     {
         $db->execute(
             'create table if not exists `' . $tablename . '_imported` ('
-            . 'md5id varchar(36) primary key,'
-            . 'filename varchar(255),'
-            . 'importdatetime datetime,'
-            . 'imported tinyint default 0,'
-            . 'message longtext)'
+                . 'md5id varchar(36) primary key,'
+                . 'filename varchar(255),'
+                . 'importdatetime datetime,'
+                . 'imported tinyint default 0,'
+                . 'message longtext)'
         );
     }
 
     private static function importCsv(string $localPath, string $filename, string $tablename, array $server, array $columns, $db): void
     {
         $enclosure = (string) ($server['enclose'] ?? '"');
+        if ($enclosure === '') {
+            $enclosure = '"';
+        }
+        if (strlen($enclosure) !== 1) {
+            throw new \InvalidArgumentException('CSV option "enclose" must contain exactly one single-byte character.');
+        }
         $delimiter = self::normalizeCsvOption((string) ($server['delimiter'] ?? ';'));
+        if (strlen($delimiter) !== 1) {
+            throw new \InvalidArgumentException('CSV option "delimiter" must contain exactly one single-byte character.');
+        }
         $lineDelimiter = self::normalizeCsvOption((string) (($server['line_delimiter'] ?? '') ?: "\n"));
 
         if ((int) ($server['use_load_file'] ?? 0) === 1) {
@@ -241,12 +237,12 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
         }
 
         try {
-            $header = fgetcsv($handle, 4000, $delimiter, $enclosure);
+            $header = fgetcsv($handle, 4000, $delimiter, $enclosure, '\\');
             if ($header === false) {
                 throw new \Exception('CSV file has no header row');
             }
             $columnMap = self::mapColumns($columns, $header);
-            while (($row = fgetcsv($handle, 4000, $delimiter, $enclosure)) !== false) {
+            while (($row = fgetcsv($handle, 4000, $delimiter, $enclosure, '\\')) !== false) {
                 self::insertMappedRow($db, $tablename, $filename, $row, $columnMap);
             }
         } finally {
@@ -265,6 +261,12 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
         string $delimiter,
         string $lineDelimiter
     ): void {
+        if (!filter_var(ini_get('mysqli.allow_local_infile'), FILTER_VALIDATE_BOOLEAN)) {
+            throw new \RuntimeException(
+                'LOAD DATA LOCAL INFILE requires mysqli.allow_local_infile=On in the PHP configuration.'
+            );
+        }
+
         $importColumns = $db->direct('select * from ds_column where table_name={t}', ['t' => $tablename], '');
         $db->execute('call addFieldIfNotExists("' . $tablename . '","import_line","integer")');
         $db->execute('set @import_line=0');
@@ -274,7 +276,7 @@ class SFTPImportRoute extends \Tualo\Office\Basic\RouteWrapper
             throw new \Exception('Unable to read CSV file');
         }
         try {
-            $header = fgetcsv($handle, 4000, $delimiter, $enclosure);
+            $header = fgetcsv($handle, 4000, $delimiter, $enclosure, '\\');
         } finally {
             fclose($handle);
         }
